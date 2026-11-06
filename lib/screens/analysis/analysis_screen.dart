@@ -1,0 +1,937 @@
+import 'dart:async';
+
+import 'package:dio/dio.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../services/auth_service.dart';
+import '../../services/blackbox_video_service.dart';
+import '../../services/consent_service.dart';
+import '../../services/device_service.dart';
+import '../../services/local_files.dart';
+import '../../services/model_analysis_service.dart';
+import '../../services/pdf_report_service.dart';
+import '../../utils/theme.dart';
+import '../../widgets/law_result_panel.dart';
+import '../../widgets/road_question_widget.dart';
+
+enum AnalysisPhase { resolving, ready }
+
+class AnalysisScreen extends ConsumerStatefulWidget {
+  const AnalysisScreen({
+    super.key,
+    required this.accidentId,
+    this.analysisService,
+    this.roadDebounce = const Duration(milliseconds: 300),
+    this.initialJobId,
+    this.initialReportId,
+    this.initialError,
+  });
+
+  final String accidentId;
+  final ModelAnalysisService? analysisService;
+  final Duration roadDebounce;
+  final String? initialJobId;
+  final String? initialReportId;
+  final String? initialError;
+
+  @override
+  ConsumerState<AnalysisScreen> createState() => _AnalysisScreenState();
+}
+
+class _AnalysisScreenState extends ConsumerState<AnalysisScreen> {
+  late final ModelAnalysisService _analysisService;
+  final LatestRequestTracker _requestTracker = LatestRequestTracker();
+
+  AnalysisPhase _phase = AnalysisPhase.resolving;
+  ModelAnalysisReport? _report;
+  String? _caseId;
+  String? _errorMessage;
+  int? _selectedPlace;
+  String? _selectedAction;
+  String? _automaticRoadStatus;
+  bool _roadWasUserSelected = false;
+  bool _isAnalyzing = false;
+  bool _reportIsPrevious = false;
+  bool _isExportingPdf = false;
+  bool _extrasExpanded = false;
+  bool _reanalyzePending = false;
+  int _roadRevision = 0;
+  Timer? _roadDebounceTimer;
+  final _egoMovementController = TextEditingController();
+  final _otherMovementController = TextEditingController();
+
+  final Map<String, bool> _userFeedback = {
+    '상대 깜빡이 미점등': false,
+    '내 깜빡이 점등': false,
+    '상대 신호위반': false,
+    '상대 과속': false,
+    '빗길·악천후': false,
+    '야간': false,
+    '어린이보호구역': false,
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _analysisService = widget.analysisService ??
+        ModelAnalysisService(
+          dio: Dio(BaseOptions(
+            baseUrl: kApiBaseUrl,
+            connectTimeout: const Duration(seconds: 15),
+            receiveTimeout: const Duration(seconds: 30),
+            headers: {'Content-Type': 'application/json'},
+          )),
+          accessToken: () => ref.read(authProvider.notifier).validAccessToken(),
+        );
+    _initialize();
+  }
+
+  @override
+  void didUpdateWidget(covariant AnalysisScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.accidentId == widget.accidentId &&
+        oldWidget.initialJobId == widget.initialJobId &&
+        oldWidget.initialReportId == widget.initialReportId &&
+        oldWidget.initialError == widget.initialError) {
+      return;
+    }
+
+    _roadDebounceTimer?.cancel();
+    _roadDebounceTimer = null;
+    _requestTracker.begin();
+    _phase = AnalysisPhase.resolving;
+    _report = null;
+    _caseId = null;
+    _errorMessage = null;
+    _selectedPlace = null;
+    _selectedAction = null;
+    _automaticRoadStatus = null;
+    _roadWasUserSelected = false;
+    _isAnalyzing = false;
+    _reportIsPrevious = false;
+    _isExportingPdf = false;
+    _extrasExpanded = false;
+    _reanalyzePending = false;
+    _roadRevision = 0;
+    _egoMovementController.clear();
+    _otherMovementController.clear();
+    _userFeedback.updateAll((_, __) => false);
+    _initialize();
+  }
+
+  @override
+  void dispose() {
+    _roadDebounceTimer?.cancel();
+    _egoMovementController.dispose();
+    _otherMovementController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _initialize() async {
+    final request = _requestTracker.begin();
+    try {
+      final directCase =
+          ModelAnalysisService.isBackendCaseId(widget.accidentId);
+      final savedDevice = directCase
+          ? (id: null, name: null)
+          : await ref.read(deviceServiceProvider).savedDevice();
+      final selectedEvent =
+          directCase ? null : ref.read(blackboxVideoProvider).event;
+      final caseId = await _analysisService.resolveCaseId(
+        accidentId: widget.accidentId,
+        registeredDeviceId: savedDevice.id,
+        selectedHardwareEventId: selectedEvent?.eventId,
+      );
+      if (!mounted || !_requestTracker.isLatest(request)) return;
+      setState(() {
+        _caseId = caseId;
+        _phase = AnalysisPhase.ready;
+        _isAnalyzing =
+            widget.initialJobId != null || widget.initialError == null;
+        _errorMessage = _friendlyErrorMessage(widget.initialError);
+      });
+
+      if (widget.initialJobId == null && widget.initialError != null) return;
+
+      final roadRevision = _roadRevision;
+      final report = widget.initialJobId != null
+          ? await _analysisService.loadJob(
+              caseId,
+              widget.initialJobId!,
+              expectedReportId: widget.initialReportId,
+            )
+          : widget.initialReportId == null
+              ? await _analysisService.requestAnalysis(caseId: caseId)
+              : await _analysisService.loadReport(
+                  caseId,
+                  widget.initialReportId!,
+                );
+      if (!mounted || !_requestTracker.isLatest(request)) return;
+      setState(() {
+        _report = report;
+        if (_roadRevision == roadRevision) _applyReportedRoad(report.road);
+        _reportIsPrevious = false;
+        _errorMessage = widget.initialJobId == null
+            ? null
+            : _friendlyErrorMessage(widget.initialError);
+        _isAnalyzing = false;
+      });
+      _runPendingAnalysis();
+    } on Object catch (error) {
+      if (!mounted || !_requestTracker.isLatest(request)) return;
+      setState(() {
+        _phase = AnalysisPhase.ready;
+        _errorMessage = _displayError(error);
+        _isAnalyzing = false;
+      });
+    }
+  }
+
+  String _displayError(Object error) {
+    if (error is ModelAnalysisException) {
+      return _friendlyErrorMessage(error.message) ?? error.message;
+    }
+    return '분석 정보를 불러오지 못했습니다. 네트워크 상태를 확인해 주세요.';
+  }
+
+  String? _friendlyErrorMessage(String? message) {
+    if (message == null) return null;
+    if (message == 'place_required' || message.contains('도로유형 선택이 필요')) {
+      return '사용자께서 도로유형 선택 시 더욱 더 정확한 결과가 나옵니다.';
+    }
+    return message;
+  }
+
+  void _changeRoad(int place, String? action) {
+    setState(() {
+      _roadRevision++;
+      _selectedPlace = place;
+      _selectedAction = place == 1 || place == 6 ? action : null;
+      _roadWasUserSelected = true;
+      _reportIsPrevious = _report != null;
+    });
+    _roadDebounceTimer?.cancel();
+    _roadDebounceTimer = Timer(widget.roadDebounce, _reanalyze);
+  }
+
+  ({Map<String, bool> facts, List<String> keywords}) _feedbackPayload() {
+    final facts = <String, bool>{};
+    final keywords = <String>[];
+    for (final item in _userFeedback.entries.where((entry) => entry.value)) {
+      switch (item.key) {
+        case '상대 깜빡이 미점등':
+          facts['opponent_lane_change'] = true;
+          keywords.addAll(const ['진로변경', '방향지시등 불이행']);
+        case '내 깜빡이 점등':
+          keywords.add('방향지시등 점등');
+        case '상대 신호위반':
+          facts['opponent_signal_violation'] = true;
+          keywords.add('신호위반');
+        case '상대 과속':
+          facts['opponent_speeding_suspected'] = true;
+          keywords.add('과속');
+        case '빗길·악천후':
+          facts['bad_weather'] = true;
+          keywords.add('빗길');
+        case '야간':
+          keywords.add('야간');
+        case '어린이보호구역':
+          facts['school_zone'] = true;
+          keywords.add('어린이보호구역');
+      }
+    }
+    return (facts: facts, keywords: keywords);
+  }
+
+  Future<void> _reanalyze() async {
+    final caseId = _caseId;
+    final place = _selectedPlace;
+    if (_isAnalyzing) {
+      _reanalyzePending = true;
+      return;
+    }
+    if (caseId == null) {
+      _showMessage('연결된 분석 케이스가 없어 재분석할 수 없습니다.');
+      return;
+    }
+    if (place == null) {
+      _showMessage('도로유형을 선택해 주세요.');
+      return;
+    }
+
+    final request = _requestTracker.begin();
+    final roadRevision = _roadRevision;
+    final feedback = _feedbackPayload();
+    setState(() {
+      _isAnalyzing = true;
+      _reportIsPrevious = _report != null;
+      _errorMessage = null;
+    });
+    try {
+      final report = await _analysisService.requestAnalysis(
+        caseId: caseId,
+        place: place,
+        otherAction: _selectedAction,
+        facts: feedback.facts,
+        keywords: feedback.keywords,
+        movements: VehicleMovements(
+          ego: _egoMovementController.text,
+          other: _otherMovementController.text,
+        ),
+      );
+      if (!mounted || !_requestTracker.isLatest(request)) return;
+      setState(() {
+        _report = report;
+        if (_roadRevision == roadRevision) _applyReportedRoad(report.road);
+        _reportIsPrevious = false;
+        _isAnalyzing = false;
+      });
+      _showMessage(
+          report.hasRates ? '실제 모델 재분석이 완료되었습니다.' : '재분석 결과를 확인해 주세요.');
+      _runPendingAnalysis();
+    } on Object catch (error) {
+      if (!mounted || !_requestTracker.isLatest(request)) return;
+      setState(() {
+        _errorMessage = _displayError(error);
+        _isAnalyzing = false;
+      });
+      _runPendingAnalysis();
+    }
+  }
+
+  void _applyReportedRoad(CaseRoadSelection road) {
+    _selectedPlace = road.place;
+    _selectedAction = road.otherAction;
+    _automaticRoadStatus = road.automaticStatus;
+    _roadWasUserSelected = road.isUserSelected;
+  }
+
+  void _runPendingAnalysis() {
+    if (!_reanalyzePending || !mounted) return;
+    _reanalyzePending = false;
+    scheduleMicrotask(_reanalyze);
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(message),
+      backgroundColor: AppTheme.surfaceDark,
+      behavior: SnackBarBehavior.floating,
+    ));
+  }
+
+  Future<void> _showAnalysisSummary(ModelAnalysisReport report) {
+    final law = LawReportResult.fromAnalysis(report.analysis);
+    return showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AppTheme.surfaceDark,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (sheetContext) => SafeArea(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.sizeOf(sheetContext).height * 0.84,
+          ),
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(24, 18, 24, 28),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        '분석 요약',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 18,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: '닫기',
+                      onPressed: () => Navigator.pop(sheetContext),
+                      icon: const Icon(Icons.close_rounded),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                _summaryRow(
+                  '과실비율',
+                  report.hasRates
+                      ? '우리 과실 ${report.rateB}% · 상대 과실 ${report.rateA}%'
+                      : '확인할 수 없음',
+                ),
+                _summaryRow(
+                  '위치·도로',
+                  _registeredLocationText(report) ?? '확인할 수 없음',
+                ),
+                _summaryRow(
+                  '기상',
+                  _weatherSummaryText(report),
+                ),
+                _summaryRow(
+                  '속도',
+                  report.speedDemo == null
+                      ? '확인할 수 없음'
+                      : '${report.speedDemo!.valueKmh} km/h',
+                ),
+                _summaryRow('법령·판례', _lawSummaryText(law)),
+                _summaryRow('분석일', _formatDate(report.createdAt)),
+                const SizedBox(height: 8),
+                const Text(
+                  legalReferenceWarning,
+                  style: TextStyle(
+                    color: AppTheme.warningOrange,
+                    fontSize: 12,
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _summaryRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 72,
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: AppTheme.textHint,
+                fontSize: 12,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 14,
+                height: 1.45,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _lawSummaryText(LawReportResult law) {
+    if (law.status == 'unavailable') return '현재 결과를 사용할 수 없음';
+    final count = law.references.length;
+    if (law.status == 'incomplete') {
+      return count == 0 ? '일부 결과만 확인됨' : '일부 결과 · 근거 $count건';
+    }
+    return count == 0 ? '검색된 근거 없음' : '확인된 법령·판례 근거 $count건';
+  }
+
+  String _formatDate(DateTime value) {
+    final local = value.toLocal();
+    String twoDigits(int number) => number.toString().padLeft(2, '0');
+    return '${local.year}.${twoDigits(local.month)}.${twoDigits(local.day)}';
+  }
+
+  String _weatherSummaryText(ModelAnalysisReport report) {
+    final weather = report.currentWeather;
+    if (weather == null) return '확인할 수 없음';
+    return '${weather.condition} · '
+        '${_formatNumber(weather.temperatureC)}℃ · '
+        '강수량 ${_formatNumber(weather.precipitationMm)}mm';
+  }
+
+  Future<void> _exportPdf() async {
+    final report = _report;
+    final caseId = _caseId;
+    if (!_canExportPdf || report == null || caseId == null) {
+      _showMessage(
+        '현재 도로 입력으로 완료된 실제 모델 분석만 PDF로 저장할 수 있습니다.',
+      );
+      return;
+    }
+    if (_isExportingPdf) return;
+    setState(() => _isExportingPdf = true);
+    try {
+      final data = ReportData(
+        accidentId: caseId,
+        analyzedAt: report.createdAt,
+        address: report.syntheticContext?.pdfAddress ?? '-',
+        accidentTypeText: report.analyzedPlace == null
+            ? ''
+            : roadLabels[report.analyzedPlace!],
+        weatherText: report.syntheticContext?.pdfWeatherText ?? '',
+        rateBPct: report.rateB!,
+        rateAPct: report.rateA!,
+        sourceLabel: '백엔드 실제 모델 분석',
+        confidencePct: null,
+        summary: report.text,
+        caveat: 'Party B와 Party A의 실제 모델 출력이며 운전자 역할을 임의로 해석하지 않습니다.',
+        appliedLaws: const [],
+        precedents: const [],
+        lawAvailable: report.lawAvailable,
+      );
+      final email = ref.read(authProvider).email;
+      if (email == null || email.isEmpty) {
+        throw StateError('PDF 저장에는 로그인 사용자 정보가 필요합니다.');
+      }
+      await PdfReportService.saveToLocal(
+        data,
+        ownerScope: LocalAppFiles.ownerScope(email),
+      );
+      await PdfReportService.generateAndShare(data);
+    } on Object catch (error) {
+      _showMessage('PDF 생성 오류: $error');
+    } finally {
+      if (mounted) setState(() => _isExportingPdf = false);
+    }
+  }
+
+  bool get _canExportPdf {
+    final report = _report;
+    return _phase == AnalysisPhase.ready &&
+        !_isAnalyzing &&
+        !_reportIsPrevious &&
+        _roadDebounceTimer?.isActive != true &&
+        report != null &&
+        report.hasRates &&
+        _caseId == report.caseId;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: AppTheme.bgBlack,
+      appBar: AppBar(
+        leading: IconButton(
+          tooltip: '뒤로',
+          onPressed: () => context.canPop() ? context.pop() : context.go('/'),
+          icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 20),
+        ),
+        title: const Text('과실 분석'),
+        actions: [
+          IconButton(
+            tooltip: 'PDF 리포트 저장',
+            onPressed: _isExportingPdf || !_canExportPdf ? null : _exportPdf,
+            icon: _isExportingPdf
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.ios_share_rounded, size: 20),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        top: false,
+        child: _phase == AnalysisPhase.resolving
+            ? const Center(child: CircularProgressIndicator())
+            : _buildContent(),
+      ),
+    );
+  }
+
+  Widget _buildContent() {
+    final chipFontFamily = Theme.of(context).textTheme.labelLarge?.fontFamily;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(24, 20, 24, 40),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildReport(),
+          const SizedBox(height: 16),
+          const Text(
+            legalReferenceWarning,
+            style: TextStyle(
+              color: AppTheme.warningOrange,
+              fontSize: 12,
+              height: 1.45,
+            ),
+          ),
+          if (_errorMessage != null) ...[
+            const SizedBox(height: 16),
+            _statusBox(
+              icon: Icons.error_outline_rounded,
+              text: _errorMessage!,
+              color: AppTheme.errorRed,
+            ),
+          ],
+          const SizedBox(height: 36),
+          const Text('도로유형', style: AppTheme.label),
+          const SizedBox(height: 6),
+          Text(
+            _roadStatusText(),
+            style: const TextStyle(color: AppTheme.textHint, fontSize: 12),
+          ),
+          const SizedBox(height: 14),
+          Theme(
+            data: Theme.of(context).copyWith(
+              chipTheme: Theme.of(context).chipTheme.copyWith(
+                    backgroundColor: AppTheme.cardDark,
+                    selectedColor: Colors.white,
+                    disabledColor: AppTheme.cardDark,
+                    labelStyle: TextStyle(
+                      color: AppTheme.textSub,
+                      fontFamily: chipFontFamily,
+                    ),
+                    secondaryLabelStyle: TextStyle(
+                      color: Colors.black,
+                      fontFamily: chipFontFamily,
+                    ),
+                    side: const BorderSide(color: AppTheme.divider),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                  ),
+            ),
+            child: RoadQuestionWidget(
+              selectedPlace: _selectedPlace,
+              selectedAction: _selectedAction,
+              onChanged: _changeRoad,
+            ),
+          ),
+          const SizedBox(height: 32),
+          const Text('사고 직전 차량 움직임 (선택)', style: AppTheme.label),
+          const SizedBox(height: 6),
+          const Text(
+            '현재 모델은 도로유형과 구조화된 상대 차량 움직임 답변을 사용합니다. 내 차량·상대 차량 자유 설명은 설명 맥락이며 과실비율 변경을 보장하지 않습니다.',
+            style: TextStyle(color: AppTheme.textHint, fontSize: 12),
+          ),
+          const SizedBox(height: 12),
+          _movementField('내 차량', _egoMovementController),
+          const SizedBox(height: 10),
+          _movementField('상대 차량', _otherMovementController),
+          const SizedBox(height: 32),
+          const Text('영상에 안 나온 정황', style: AppTheme.label),
+          const SizedBox(height: 12),
+          _buildExtras(),
+          const SizedBox(height: 24),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: _isAnalyzing ? null : _reanalyze,
+              icon: _isAnalyzing
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.refresh_rounded),
+              label: Text(_isAnalyzing ? '모델 분석 중' : '추가 정황 반영하여 재분석'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _roadStatusText() {
+    if (_roadWasUserSelected) return '저장된 사용자 선택을 불러왔습니다.';
+    return switch (_automaticRoadStatus) {
+      'estimated' => 'GPS 기반 자동 추정값입니다. 필요하면 수정해 주세요.',
+      'needs_confirmation' => 'GPS만으로 도로유형을 확정하지 못했습니다. 직접 선택해 주세요.',
+      'unavailable' => '도로 자동 추정을 사용할 수 없습니다. 직접 선택해 주세요.',
+      _ => '사고 당시 도로 형태를 선택해 주세요.',
+    };
+  }
+
+  Widget _buildReport() {
+    final report = _report;
+    if (_isAnalyzing && report == null) {
+      return _statusBox(
+        icon: Icons.auto_awesome_rounded,
+        text: '백엔드 실제 모델이 사고 영상을 분석하고 있습니다.',
+        color: Colors.white,
+      );
+    }
+    if (report == null) {
+      return _statusBox(
+        icon: Icons.info_outline_rounded,
+        text: '표시할 모델 분석 결과가 없습니다. 도로유형을 선택해 재분석해 주세요.',
+        color: AppTheme.textSub,
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (_reportIsPrevious) ...[
+          _statusBox(
+            icon: Icons.history_rounded,
+            text: '이전 분석 결과',
+            color: AppTheme.warningOrange,
+          ),
+          const SizedBox(height: 16),
+        ],
+        if (report.hasRates) ...[
+          Row(
+            children: [
+              _rateSide('우리 과실', report.rateB!),
+              Container(width: 1, height: 70, color: AppTheme.divider),
+              _rateSide('상대 과실', report.rateA!),
+            ],
+          ),
+          const SizedBox(height: 30),
+        ] else
+          _statusBox(
+            icon: Icons.info_outline_rounded,
+            text: _modelUnavailableText(report),
+            color: AppTheme.warningOrange,
+          ),
+        const SizedBox(height: 24),
+        if (_registeredGpsSummary(report) case final summary?) ...[
+          _statusBox(
+            icon: Icons.location_on_outlined,
+            text: summary,
+            color: AppTheme.textSub,
+          ),
+          const SizedBox(height: 24),
+        ],
+        _statusBox(
+          icon: Icons.cloud_outlined,
+          text: _weatherText(report),
+          color:
+              report.currentWeather == null ? AppTheme.textSub : Colors.white,
+        ),
+        const SizedBox(height: 24),
+        if (report.speedDemo != null) ...[
+          _statusBox(
+            icon: Icons.speed_rounded,
+            text: '참고 속도\n${report.speedDemo!.valueKmh} km/h',
+            color: AppTheme.textSub,
+          ),
+          const SizedBox(height: 24),
+        ],
+        LawResultPanel(analysis: report.analysis),
+        const SizedBox(height: 14),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: () => _showAnalysisSummary(report),
+            icon: const Icon(Icons.summarize_outlined, size: 18),
+            label: const Text('분석 요약 보기'),
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _modelUnavailableText(ModelAnalysisReport report) {
+    return switch (report.reason) {
+      'place_required' => '사용자께서 도로유형 선택 시 더욱 더 정확한 결과가 나옵니다.',
+      'no_original_video' => '원본 사고 영상이 없어 모델 분석을 실행할 수 없습니다.',
+      'unsupported_input' => '모델이 지원하지 않는 영상 형식입니다.',
+      'decode_failed' => '사고 영상을 해석하지 못했습니다.',
+      'clip_too_short' => '분석할 사고 영상 구간이 너무 짧습니다.',
+      _ => report.status == ModelReportStatus.incomplete
+          ? '모델 분석에 필요한 입력이 아직 완전하지 않습니다.'
+          : '모델 분석을 사용할 수 없습니다.',
+    };
+  }
+
+  String? _registeredGpsSummary(ModelAnalysisReport report) {
+    final automatic = report.road.raw['automatic'];
+    if (automatic is! Map) return null;
+    final gps = automatic['gps'];
+    if (gps is! Map ||
+        !_validCoordinate(gps['lat'], -90, 90) ||
+        !_validCoordinate(gps['lon'], -180, 180)) {
+      return null;
+    }
+    final address = _nonEmptyText(automatic['address']);
+    final roadName = _nonEmptyText(automatic['road_name']);
+    final location = address ?? roadName;
+    final place = report.road.place;
+    final topology = place == null ? null : roadLabels[place];
+    if (address != null && roadName != null && topology != null) {
+      return '등록된 GPS 위치는 $address이며, 도로명은 $roadName입니다. '
+          '선택한 도로유형은 $topology입니다.';
+    }
+    if (address != null && roadName != null) {
+      return '등록된 GPS 위치는 $address이며, 도로명은 $roadName입니다.';
+    }
+    if (location != null && topology != null) {
+      return '등록된 GPS 위치는 $location이며, 선택한 도로유형은 $topology입니다.';
+    }
+    if (location != null) return '등록된 GPS 위치는 $location입니다.';
+    if (topology != null) {
+      return '등록된 GPS 위치 정보가 확인되었으며, 선택한 도로유형은 $topology입니다.';
+    }
+    return '등록된 GPS 위치 정보가 확인되었습니다.';
+  }
+
+  String? _registeredLocationText(ModelAnalysisReport report) {
+    final automatic = report.road.raw['automatic'];
+    if (automatic is! Map) return null;
+    final gps = automatic['gps'];
+    if (gps is! Map ||
+        !_validCoordinate(gps['lat'], -90, 90) ||
+        !_validCoordinate(gps['lon'], -180, 180)) {
+      return null;
+    }
+    final values = <String>[
+      if (_nonEmptyText(automatic['address']) case final address?) address,
+      if (_nonEmptyText(automatic['road_name']) case final roadName?) roadName,
+      if (report.road.place case final place?) roadLabels[place],
+    ];
+    return values.isEmpty ? '등록된 위치 정보' : values.join(' · ');
+  }
+
+  bool _validCoordinate(Object? value, num min, num max) =>
+      value is num && value.isFinite && value >= min && value <= max;
+
+  String? _nonEmptyText(Object? value) {
+    if (value is! String || value.trim().isEmpty) return null;
+    return value.trim();
+  }
+
+  String _weatherText(ModelAnalysisReport report) {
+    final weather = report.currentWeather;
+    if (weather == null) return '현재 기상 정보를 확인할 수 없습니다.';
+    return '기상은 현재 ${weather.condition}, '
+        '${_formatNumber(weather.temperatureC)}℃, '
+        '강수량 ${_formatNumber(weather.precipitationMm)}mm입니다.';
+  }
+
+  String _formatNumber(double value) => value == value.roundToDouble()
+      ? value.toInt().toString()
+      : value.toString();
+
+  Widget _rateSide(String label, int rate) {
+    return Expanded(
+      child: Column(
+        children: [
+          Text(label,
+              style: const TextStyle(color: AppTheme.textSub, fontSize: 13)),
+          const SizedBox(height: 8),
+          Text(
+            '$rate%',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 46,
+              fontWeight: FontWeight.w200,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _movementField(
+    String label,
+    TextEditingController controller,
+  ) {
+    return TextField(
+      controller: controller,
+      enabled: !_isAnalyzing,
+      maxLength: 500,
+      minLines: 1,
+      maxLines: 3,
+      decoration: InputDecoration(
+        labelText: '$label (선택)',
+        hintText: '$label 움직임을 간단히 적어주세요',
+        border: const OutlineInputBorder(),
+      ),
+    );
+  }
+
+  Widget _statusBox({
+    required IconData icon,
+    required String text,
+    required Color color,
+  }) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppTheme.cardDark,
+        border: Border.all(color: AppTheme.divider),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, color: color, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(color: AppTheme.textSub, height: 1.4),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildExtras() {
+    final count = _userFeedback.values.where((value) => value).length;
+    return Column(
+      children: [
+        InkWell(
+          onTap: _isAnalyzing
+              ? null
+              : () => setState(() => _extrasExpanded = !_extrasExpanded),
+          borderRadius: BorderRadius.circular(6),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            decoration: BoxDecoration(
+              color: AppTheme.cardDark,
+              border: Border.all(color: AppTheme.divider),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(count == 0 ? '추가 정황 선택' : '$count개 선택됨'),
+                ),
+                Icon(_extrasExpanded
+                    ? Icons.keyboard_arrow_up_rounded
+                    : Icons.keyboard_arrow_down_rounded),
+              ],
+            ),
+          ),
+        ),
+        if (_extrasExpanded) ...[
+          const SizedBox(height: 8),
+          Material(
+            color: AppTheme.cardDark,
+            shape: RoundedRectangleBorder(
+              side: const BorderSide(color: AppTheme.divider),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Column(
+              children: _userFeedback.entries.map((entry) {
+                return CheckboxListTile(
+                  dense: true,
+                  value: entry.value,
+                  title: Text(entry.key),
+                  onChanged: _isAnalyzing
+                      ? null
+                      : (value) => setState(
+                            () => _userFeedback[entry.key] = value ?? false,
+                          ),
+                );
+              }).toList(),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
