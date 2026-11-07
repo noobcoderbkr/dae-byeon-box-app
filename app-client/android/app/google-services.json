@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "113067542710",
+    "project_id": "poopbox-4728c",
+    "storage_bucket": "poopbox-4728c.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:113067542710:android:60d78428a5c5fe00723e17",
+        "android_client_info": {
+          "package_name": "com.poopbox2.poopbox2"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC9HZZFurgD9346ImXBYegGvW8X28KrKbc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
