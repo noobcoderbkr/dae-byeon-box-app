@@ -3,15 +3,14 @@
 ## English
 
 Flutter app delivered together with the backend on `REAL_MOCKUP`.
-Backend sources remain at the repository root; mobile sources live in `app/`.
+Backend and Flutter app sources are organized at the repository root.
 Use the backend source from the same commit for matching contracts.
 This is a normal directory, not a Git submodule. Source: `pth888/driveguard-ai`
 base `92fbec0a`, with model-input changes from `7b386b8`.
 
-From the Blackbox repository root:
+From the repository root:
 
 ```bash
-cd app
 flutter pub get
 flutter test
 flutter run --dart-define=API_BASE_URL=https://<private-api-host>
@@ -69,3 +68,12 @@ Android 표준 Gradle 실행 파일을 포함했다. iOS는 먼저 flutter pub g
 Pod 잠금 파일은 배포 설정으로 재사용하지 않는다. ML Kit의 기기·도구 지원 제한으로
 전체 arm64 시뮬레이터 빌드가 막힐 수 있으며 실기기 서명·권한·설치는 별도 검증한다.
 API_BASE_URL과 접근 가능한 저장소 주소를 설정하고 handoff.md를 따른다.
+
+## Analysis flow fix
+
+The analysis report screen previously had no explicit completion action. After
+road selection triggered a reanalysis, the report remained on the same screen,
+which could look like the app had not advanced. A completion button is now shown
+when a report is available and analysis is idle. It returns to the previous
+screen when possible, otherwise it opens the incident-video list. This improves
+navigation; it does not mask or claim to fix backend/model job failures.

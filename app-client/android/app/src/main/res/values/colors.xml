@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <!-- 앱 배경색 (AppTheme.bgBlack 과 동일) -->
-    <color name="launch_background">#0A0A0A</color>
-</resources>

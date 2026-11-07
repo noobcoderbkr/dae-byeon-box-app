@@ -635,6 +635,23 @@ class _AnalysisScreenState extends ConsumerState<AnalysisScreen> {
               label: Text(_isAnalyzing ? '모델 분석 중' : '추가 정황 반영하여 재분석'),
             ),
           ),
+          if (_report != null && !_isAnalyzing) ...[
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: () {
+                  if (context.canPop()) {
+                    context.pop();
+                  } else {
+                    context.goNamed('accident-videos');
+                  }
+                },
+                icon: const Icon(Icons.video_library_outlined),
+                label: const Text('분석 완료하고 돌아가기'),
+              ),
+            ),
+          ],
         ],
       ),
     );
