@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../services/hardware_event_service.dart';
 import '../screens/home/main_page.dart';
 import '../screens/mypage/mypage_screen.dart';
 import '../screens/accident/accident_detection_screen.dart';
@@ -164,9 +165,14 @@ final appRouterProvider = Provider<GoRouter>((ref) {
           GoRoute(
             path: '/accident-detected',
             name: 'accident-detected',
-            builder: (ctx, state) => AccidentDetectionScreen(
-              caseId: state.extra as String?,
-            ),
+            builder: (ctx, state) {
+              final extra = state.extra;
+              // 블랙박스 충격 알림이면 HardwareEvent, 휴대폰 센서면 사건 ID(String)
+              return AccidentDetectionScreen(
+                caseId: extra is String ? extra : null,
+                hardwareEvent: extra is HardwareEvent ? extra : null,
+              );
+            },
           ),
 
           // ── 초동 대처 가이드 (사고 접수 활성화) ───────────────────
@@ -180,10 +186,17 @@ final appRouterProvider = Provider<GoRouter>((ref) {
                   : extra as String? ?? '';
               final initialVideoStep = extra is Map<String, dynamic> &&
                   extra['initial_video_step'] == true;
+              final hardwareEvent = extra is Map<String, dynamic> &&
+                      extra['hardware_event'] is HardwareEvent
+                  ? extra['hardware_event'] as HardwareEvent
+                  : null;
               return FirstResponseScreen(
-                key: ValueKey(accidentId),
+                key: ValueKey(accidentId.isEmpty && hardwareEvent != null
+                    ? 'hw-${hardwareEvent.key}'
+                    : accidentId),
                 accidentId: accidentId,
                 initialVideoStep: initialVideoStep,
+                hardwareEvent: hardwareEvent,
               );
             },
           ),

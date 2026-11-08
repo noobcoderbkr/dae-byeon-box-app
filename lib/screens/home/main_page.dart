@@ -1,12 +1,15 @@
 // lib/screens/home/main_page.dart
 // 테슬라 미니멀 스타일
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../services/auth_service.dart';
 import '../../services/case_service.dart';
+import '../../services/hardware_event_service.dart';
 import '../../services/sensor_service.dart';
 import '../../services/location_service.dart';
 import '../../utils/theme.dart';
@@ -22,6 +25,8 @@ class MainPage extends ConsumerStatefulWidget {
 
 class _MainPageState extends ConsumerState<MainPage> {
   bool _openingManualIncident = false;
+  StreamSubscription<HardwareEvent>? _hardwareSub;
+  late final HardwareEventWatcher _hardwareWatcher;
 
   @override
   void initState() {
@@ -29,6 +34,33 @@ class _MainPageState extends ConsumerState<MainPage> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(locationProvider.notifier).requestLocationAndFetch();
     });
+    // 블랙박스 충격 알림: 홈 화면이 보이고 앱이 앞에 있을 때만 1초마다 조회
+    _hardwareWatcher = ref.read(hardwareEventWatcherProvider);
+    _hardwareSub = _hardwareWatcher.incidents.listen(_onHardwareIncident);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _hardwareWatcher.start(isActive: _homeIsVisible);
+    });
+  }
+
+  bool _homeIsVisible() {
+    if (!mounted) return false;
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    if (lifecycle != null && lifecycle != AppLifecycleState.resumed) {
+      return false;
+    }
+    return ModalRoute.of(context)?.isCurrent ?? true;
+  }
+
+  void _onHardwareIncident(HardwareEvent event) {
+    if (!mounted || !_homeIsVisible()) return;
+    context.pushNamed('accident-detected', extra: event);
+  }
+
+  @override
+  void dispose() {
+    _hardwareSub?.cancel();
+    _hardwareWatcher.stop();
+    super.dispose();
   }
 
   @override

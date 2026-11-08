@@ -12,6 +12,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../services/auth_service.dart';
 import '../../services/blackbox_video_service.dart';
 import '../../services/case_service.dart';
+import '../../services/hardware_event_service.dart';
 import '../../services/local_files.dart';
 import '../../services/profile_service.dart';
 import '../../widgets/blackbox_video_player_widget.dart';
@@ -27,7 +28,12 @@ class FirstResponseScreen extends ConsumerStatefulWidget {
     super.key,
     required this.accidentId,
     this.initialVideoStep = false,
+    this.hardwareEvent,
   });
+
+  /// 블랙박스 충격 알림으로 시작한 경우. accidentId 가 비어 있으면
+  /// 같은 기기·같은 이벤트에 사고 사건(case_id)이 연결될 때까지 기다린다.
+  final HardwareEvent? hardwareEvent;
 
   @override
   ConsumerState<FirstResponseScreen> createState() =>
@@ -36,7 +42,14 @@ class FirstResponseScreen extends ConsumerStatefulWidget {
 
 class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
   final ImagePicker _picker = ImagePicker();
-  late final void Function() _cancelVideoRequest;
+  void Function() _cancelVideoRequest = _noop;
+  static void _noop() {}
+
+  /// 이 화면이 다루는 사고 사건 ID. 블랙박스 알림으로 시작했고 아직 영상이
+  /// 연결되지 않았으면 빈 문자열이다.
+  late String _targetCaseId = widget.accidentId;
+  bool get _waitingForBlackboxCase =>
+      _targetCaseId.isEmpty && widget.hardwareEvent != null;
   int _photoCount = 0;
   int _videoCount = 0;
   int _currentStep = 0;
@@ -53,9 +66,11 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
   @override
   void initState() {
     super.initState();
-    _cancelVideoRequest = ref
-        .read(blackboxVideoProvider.notifier)
-        .cancellationHandleForCase(widget.accidentId);
+    if (_targetCaseId.isNotEmpty) {
+      _cancelVideoRequest = ref
+          .read(blackboxVideoProvider.notifier)
+          .cancellationHandleForCase(_targetCaseId);
+    }
     if (widget.initialVideoStep) _currentStep = _steps.length - 1;
     _loadInsuranceInfo();
     WidgetsBinding.instance.addPostFrameCallback((_) => _initializeCase());
@@ -76,11 +91,27 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
             owner != null &&
             auth.sessionGeneration == generation &&
             authenticatedPrincipal(ref.read(authProvider)) == owner;
+    if (_targetCaseId.isEmpty) {
+      final event = widget.hardwareEvent;
+      if (event == null) {
+        setState(() => _caseError = '사고 사건 정보가 없습니다.');
+        return;
+      }
+      // 알림이 영상보다 먼저 도착한다. 같은 기기·같은 이벤트에 case_id 가 붙을 때까지 기다린다.
+      final caseId = await ref
+          .read(hardwareEventWatcherProvider)
+          .waitForCaseId(event, isActive: isCurrentOwner);
+      if (caseId == null || !isCurrentOwner()) return;
+      setState(() => _targetCaseId = caseId);
+      _cancelVideoRequest = ref
+          .read(blackboxVideoProvider.notifier)
+          .cancellationHandleForCase(caseId);
+    }
     try {
       final backendCase = await ref
           .read(caseServiceProvider)
-          .selectOwnedCase(widget.accidentId);
-      if (!isCurrentOwner() || backendCase.id != widget.accidentId) return;
+          .selectOwnedCase(_targetCaseId);
+      if (!isCurrentOwner() || backendCase.id != _targetCaseId) return;
       setState(() {
         _caseId = backendCase.id;
         _caseError = null;
@@ -96,9 +127,13 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
   }
 
   Future<String> _requireOwnedCase() async {
+    if (_targetCaseId.isEmpty) {
+      throw const InvalidBackendCaseException(
+          '블랙박스 영상이 서버에 올라오는 중입니다. 사고 사건이 연결되면 다시 시도해 주세요.');
+    }
     final backendCase =
-    await ref.read(caseServiceProvider).selectOwnedCase(widget.accidentId);
-    if (!mounted || backendCase.id != widget.accidentId) {
+    await ref.read(caseServiceProvider).selectOwnedCase(_targetCaseId);
+    if (!mounted || backendCase.id != _targetCaseId) {
       throw const InvalidBackendCaseException('사고 사건이 변경되었습니다. 다시 시도해 주세요.');
     }
     _caseId = backendCase.id;
@@ -589,7 +624,16 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
   // ── 블랙박스 영상 섹션 ───────────────────────────────────
   Widget _buildVideoSection() {
     final received = ref.watch(blackboxVideoProvider);
-    if (_caseId != widget.accidentId) {
+    if (_waitingForBlackboxCase) {
+      return _buildVideoStatus(
+        icon: Icons.cloud_upload_outlined,
+        title: '블랙박스 영상 연결 대기 중',
+        subtitle: '충격 알림은 도착했습니다. 영상이 서버에 올라와 사고 사건이 연결되면 자동으로 이어집니다.',
+        showLoading: true,
+        showRetry: false,
+      );
+    }
+    if (_caseId != _targetCaseId) {
       return _buildVideoStatus(
         icon: Icons.search_rounded,
         title: _caseError == null ? '영상 확인 중' : '사고 사건을 확인할 수 없습니다',
@@ -745,8 +789,8 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
                 ),
                 const SizedBox(height: 8),
                 AccidentLocationMap(
-                  key: ValueKey('map-${widget.accidentId}'),
-                  caseId: widget.accidentId,
+                  key: ValueKey('map-${_targetCaseId}'),
+                  caseId: _targetCaseId,
                 ),
               ],
             ),
@@ -863,7 +907,7 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
   Widget _buildBottomButton() {
     final videoState = ref.watch(blackboxVideoProvider);
     final isVideoStep = _currentStep == _steps.length - 1;
-    final analysisReady = _caseId == widget.accidentId &&
+    final analysisReady = _caseId == _targetCaseId &&
         videoState.caseId == _caseId &&
         videoState.status == VideoStatus.ready &&
         videoState.localPath != null;
@@ -907,10 +951,10 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
   Future<void> _openVideoPicker() async {
     final selected = await showAccidentCasePicker(
       context,
-      currentCaseId: widget.accidentId,
+      currentCaseId: _targetCaseId,
     );
     if (!mounted || selected == null) return;
-    if (selected == widget.accidentId) {
+    if (selected == _targetCaseId) {
       // 지금 보고 있는 사고를 다시 고르면 영상만 다시 불러온다.
       await _initializeCase();
       return;
@@ -1031,6 +1075,10 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
   }
 
   Future<void> _callPhone(String number) async {
+    if (widget.hardwareEvent?.testEvent == true) {
+      _showMessage('테스트 충격 알림이라 실제 전화 연결은 하지 않습니다.');
+      return;
+    }
     final cleanNumber = number.replaceAll('-', '').replaceAll(' ', '');
     final uri = Uri(scheme: 'tel', path: cleanNumber);
     try {

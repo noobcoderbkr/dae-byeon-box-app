@@ -7,6 +7,7 @@ import 'dart:io' if (dart.library.html) '../utils/io_web_stub.dart';
 
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -320,6 +321,44 @@ class BackendEvidenceService {
 
     final token = await _requiredToken();
     requireCurrent();
+    final resolved = await _resolveOriginalVideo(
+      caseId: caseId,
+      token: token,
+      cancelToken: cancelToken,
+      requireCurrent: requireCurrent,
+    );
+    final original = resolved.file;
+    final url = resolved.url;
+    final partial = File('$savePath.part_'
+        '${DateTime.now().microsecondsSinceEpoch}_${++_downloadSequence}');
+    try {
+      await _storageDio.downloadUri(
+        Uri.parse(url),
+        partial.path,
+        options: Options(
+          responseType: ResponseType.bytes,
+          validateStatus: (status) =>
+              status != null && status >= 200 && status < 300,
+        ),
+        cancelToken: cancelToken,
+        onReceiveProgress: onProgress,
+      );
+      requireCurrent();
+      // Publish without an await between the lifecycle check and atomic rename.
+      partial.renameSync(savePath);
+    } finally {
+      if (partial.existsSync()) partial.deleteSync();
+    }
+    return DownloadedCaseVideo(file: original, localPath: savePath);
+  }
+
+  /// 원본 영상 파일 정보와 사전서명 접근 주소를 받는다.
+  Future<({BackendCaseFile file, String url})> _resolveOriginalVideo({
+    required String caseId,
+    required String token,
+    required CancelToken? cancelToken,
+    required void Function() requireCurrent,
+  }) async {
     String? cursor;
     BackendCaseFile? original;
     do {
@@ -371,27 +410,63 @@ class BackendEvidenceService {
         Uri.tryParse(url)?.hasScheme != true) {
       throw const EvidenceServiceException('서버의 영상 접근 응답이 올바르지 않습니다.');
     }
-    final partial = File('$savePath.part_'
-        '${DateTime.now().microsecondsSinceEpoch}_${++_downloadSequence}');
-    try {
-      await _storageDio.downloadUri(
-        Uri.parse(url),
-        partial.path,
-        options: Options(
-          responseType: ResponseType.bytes,
-          validateStatus: (status) =>
-              status != null && status >= 200 && status < 300,
-        ),
-        cancelToken: cancelToken,
-        onReceiveProgress: onProgress,
-      );
-      requireCurrent();
-      // Publish without an await between the lifecycle check and atomic rename.
-      partial.renameSync(savePath);
-    } finally {
-      if (partial.existsSync()) partial.deleteSync();
+    return (file: original, url: url);
+  }
+
+  /// 웹용: 영상을 내려받지 않고, 브라우저가 바로 재생할 접근 주소만 받는다.
+  Future<({BackendCaseFile file, String url})> originalVideoUrl({
+    required String caseId,
+    CancelToken? cancelToken,
+    bool Function()? isCurrent,
+  }) async {
+    _requireCaseId(caseId);
+    void requireCurrent() {
+      if (cancelToken?.isCancelled == true || isCurrent?.call() == false) {
+        throw DioException.requestCancelled(
+          requestOptions: RequestOptions(path: caseId),
+          reason: 'The account or video request changed',
+        );
+      }
     }
-    return DownloadedCaseVideo(file: original, localPath: savePath);
+
+    final token = await _requiredToken();
+    requireCurrent();
+    return _resolveOriginalVideo(
+      caseId: caseId,
+      token: token,
+      cancelToken: cancelToken,
+      requireCurrent: requireCurrent,
+    );
+  }
+
+  /// 사건에 올라간 모든 증거 파일 목록 (정밀 분석 리포트의 무결성 표시용)
+  Future<List<BackendCaseFile>> listCaseFiles(String caseId) async {
+    _requireCaseId(caseId);
+    final token = await _requiredToken();
+    final files = <BackendCaseFile>[];
+    String? cursor;
+    do {
+      final response = await _apiDio.get(
+        '/api/v1/cases/$caseId/files',
+        queryParameters: {'limit': 100, if (cursor != null) 'cursor': cursor},
+        options: Options(headers: _bearer(token)),
+      );
+      if (response.statusCode != 200) {
+        throw EvidenceServiceException(
+          _apiMessage(response, '증거 파일 목록을 불러오지 못했습니다.'),
+        );
+      }
+      final data = _envelope(response);
+      final items = data['files'];
+      if (items is! List) {
+        throw const EvidenceServiceException('서버의 파일 목록 응답이 올바르지 않습니다.');
+      }
+      for (final item in items) {
+        files.add(BackendCaseFile.fromJson(_map(item), expectedCaseId: caseId));
+      }
+      cursor = _cursor(data['next_cursor']);
+    } while (cursor != null);
+    return files;
   }
 
   Future<List<BackendCaseFile>> listAiEligibleFiles(String caseId) async {
@@ -585,6 +660,10 @@ class BlackboxVideoNotifier extends StateNotifier<BlackboxVideoState> {
     try {
       await _ensureOwnedCase(accidentId);
       if (!current()) return;
+      if (kIsWeb) {
+        await _resolveForWeb(accidentId, cancelToken, current);
+        return;
+      }
       final dir = await _documentsDirectory();
       if (!current()) return;
       final savePath = '${dir.path}/blackbox_$accidentId.mp4';
@@ -639,6 +718,48 @@ class BlackboxVideoNotifier extends StateNotifier<BlackboxVideoState> {
       );
     } finally {
       if (identical(_cancelToken, cancelToken)) _cancelToken = null;
+    }
+  }
+
+  // 웹: 브라우저는 파일 저장이 안 되므로 사전서명 주소로 바로 스트리밍한다.
+  // (localPath 자리에 재생 주소를 넣고, 플레이어가 kIsWeb 이면 네트워크 재생)
+  Future<void> _resolveForWeb(
+    String accidentId,
+    CancelToken cancelToken,
+    bool Function() current,
+  ) async {
+    final pollingStartedAt = _now();
+    while (current()) {
+      try {
+        state = state.copyWith(status: VideoStatus.fetching);
+        final resolved = await _evidenceService.originalVideoUrl(
+          caseId: accidentId,
+          cancelToken: cancelToken,
+          isCurrent: current,
+        );
+        if (!current()) return;
+        state = BlackboxVideoState(
+          caseId: accidentId,
+          status: VideoStatus.ready,
+          event: BlackboxEvent.fromFile(resolved.file),
+          localPath: resolved.url,
+          downloadProgress: 1,
+        );
+        return;
+      } on EvidenceServiceException catch (error) {
+        if (!error.message.contains('아직 전송된')) rethrow;
+        if (!current()) return;
+        final timedOut = _now().difference(pollingStartedAt) >= pollTimeout;
+        state = BlackboxVideoState(
+          caseId: accidentId,
+          status: VideoStatus.waiting,
+          errorMessage: timedOut
+              ? '해당 사고의 원본 영상이 아직 준비되지 않았습니다. 잠시 후 다시 확인해 주세요.'
+              : '해당 사고의 원본 영상이 아직 준비되지 않았습니다. 자동으로 다시 확인합니다.',
+        );
+        if (timedOut) return;
+        await _waitForNextPoll(cancelToken);
+      }
     }
   }
 
