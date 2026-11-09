@@ -25,17 +25,11 @@ void main() {
       accidentId: caseA,
       analyzedAt: analyzedAt,
       address: '-',
-      accidentTypeText: '교차로 사고',
       weatherText: '',
-      rateBPct: 60,
-      rateAPct: 40,
-      sourceLabel: '백엔드 실제 모델 분석',
-      confidencePct: null,
-      summary: '검증된 분석',
-      caveat: 'Party B/A',
-      appliedLaws: const [],
-      precedents: const [],
-      lawAvailable: false,
+      rateOurPct: 60,
+      rateOtherPct: 40,
+      aiSummary: '검증된 분석',
+      lawStatusNote: '법령 검색 결과 없음',
     );
 
     final path = await PdfReportService.saveToLocal(

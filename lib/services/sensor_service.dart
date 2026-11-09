@@ -2,7 +2,7 @@
 //
 // 담당 기능: 3.1 스마트폰 내부 센서 연동 사고 자동 감지 (E-Call 가상화)
 //   - sensors_plus 패키지로 가속도·자이로 센서 구독
-//   - 임계값 초과 시 사고 감지 → 자동 창 팝업 + GPS 긴급 SMS 발송
+//   - 임계값 초과 시 사고 감지 → 15초 응답 화면 (긴급 알림은 별도 처리)
 //
 // 사용 패키지:
 //   sensors_plus: ^4.0.2        (pubspec.yaml dependencies)
@@ -16,9 +16,7 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:sensors_plus/sensors_plus.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import 'auth_service.dart';
 import 'case_service.dart';
@@ -26,14 +24,15 @@ import 'consent_service.dart';
 import 'notification_service.dart';
 
 /// 충격 감지 임계값 (G-Force)
-/// 일반 급제동 ≈ 0.8G, 사고 수준 ≈ 2.5G 이상
-const double kImpactThresholdG = 2.5;
+/// 앱 보조 감지 임계값. 블랙박스 ADXL345 설정과는 별도이며 서버/기기 설정은 아니다.
+const double kImpactThresholdG = 1.5;
 
 /// 충격 감지 상태 (Riverpod StateNotifier)
 class SensorState {
   final bool isMonitoring;
   final bool isImpactDetected;
   final double currentGForce;
+  final double? detectedGForce;
   final DateTime? detectedAt;
   final String? caseId;
   final String? errorMessage;
@@ -42,6 +41,7 @@ class SensorState {
     this.isMonitoring = false,
     this.isImpactDetected = false,
     this.currentGForce = 0.0,
+    this.detectedGForce,
     this.detectedAt,
     this.caseId,
     this.errorMessage,
@@ -51,6 +51,8 @@ class SensorState {
     bool? isMonitoring,
     bool? isImpactDetected,
     double? currentGForce,
+    double? detectedGForce,
+    bool clearDetectedGForce = false,
     DateTime? detectedAt,
     String? caseId,
     String? errorMessage,
@@ -59,6 +61,8 @@ class SensorState {
         isMonitoring: isMonitoring ?? this.isMonitoring,
         isImpactDetected: isImpactDetected ?? this.isImpactDetected,
         currentGForce: currentGForce ?? this.currentGForce,
+        detectedGForce:
+            clearDetectedGForce ? null : detectedGForce ?? this.detectedGForce,
         detectedAt: detectedAt ?? this.detectedAt,
         caseId: caseId ?? this.caseId,
         errorMessage: errorMessage,
@@ -188,7 +192,7 @@ class SensorNotifier extends StateNotifier<SensorState> {
   // 블박이 충격을 감지해 백엔드를 거쳐 FCM 푸시가 오면 PushService 가 이 메서드를 부른다.
   // 블박이 주 감지자이므로, 이 경로가 폰 센서보다 우선한다.
   //   lat/lon: 블박이 보낸 GPS 좌표(있으면 사용)
-  //   gForce : 블박이 보낸 충격 수치(없으면 임계값으로 대체)
+  //   gForce : 블박이 보낸 실제 충격 수치. 누락 시 임계값을 측정값으로 대체하지 않는다.
   Future<void> triggerFromExternal({
     required String? caseId,
     double? lat,
@@ -223,10 +227,10 @@ class SensorNotifier extends StateNotifier<SensorState> {
     }
     _lastImpactTime = now;
 
-    final g = gForce ?? kImpactThresholdG;
     state = state.copyWith(
       isImpactDetected: true,
-      currentGForce: g,
+      detectedGForce: gForce,
+      clearDetectedGForce: gForce == null,
       detectedAt: now,
       caseId: caseId,
       errorMessage: null,
@@ -234,7 +238,7 @@ class SensorNotifier extends StateNotifier<SensorState> {
 
     // 1) 로컬 푸시 알림 표시
     if (!_isAuthorizedFor(authorization)) return;
-    await NotificationService.showImpactAlert(caseId: caseId!, gForce: g);
+    await NotificationService.showImpactAlert(caseId: caseId!, gForce: gForce);
   }
 
   // ── 충격 감지 처리 ───────────────────────────────────────
@@ -259,6 +263,7 @@ class SensorNotifier extends StateNotifier<SensorState> {
     state = state.copyWith(
       isImpactDetected: true,
       currentGForce: gForce,
+      detectedGForce: gForce,
       detectedAt: detectedAt,
       caseId: caseId,
       errorMessage: null,
@@ -266,74 +271,7 @@ class SensorNotifier extends StateNotifier<SensorState> {
 
     // 1) 로컬 푸시 알림 표시 (flutter_local_notifications)
     await NotificationService.showImpactAlert(caseId: caseId, gForce: gForce);
-    if (!_isAuthorizedFor(authorization)) return;
-
-    // 2) GPS 좌표 취득 (geolocator)
-    //    10초간 무응답 시 자동 SMS 발송
-    _scheduleAutoEmergencySms(
-      detectedAt,
-      authorization: authorization,
-    );
-  }
-
-  // ── 10초 무응답 시 긴급 SMS 자동 발송 ───────────────────
-  // externalLat/externalLon: 블박이 보낸 좌표가 있으면 폰 GPS 대신 이것을 사용
-  void _scheduleAutoEmergencySms(
-    DateTime detectedAt, {
-    required int authorization,
-    double? externalLat,
-    double? externalLon,
-  }) {
-    Future.delayed(const Duration(seconds: 10), () async {
-      // 아직 감지 상태라면 (사용자가 해제 안 했다면) 자동 발송
-      if (!_isAuthorizedFor(authorization) || !state.isImpactDetected) return;
-
-      // 블박 좌표가 있으면 그대로 사용 (폰 GPS 조회 생략)
-      if (externalLat != null && externalLon != null) {
-        await _sendEmergencySmsRaw(externalLat, externalLon, authorization);
-        return;
-      }
-
-      try {
-        final position = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.high,
-        );
-        if (!_isAuthorizedFor(authorization)) return;
-        await _sendEmergencySms(position, authorization);
-      } catch (_) {
-        // 위치 취득 실패 시 최후 알려진 위치 사용
-      }
-    });
-  }
-
-  // ── 긴급 SMS 발송 (url_launcher) ────────────────────────
-  // Android: sms: URI, iOS: sms: URI
-  // telephony 패키지로 백그라운드 자동 발송 가능 (Android only)
-  Future<void> _sendEmergencySms(Position position, int authorization) async {
-    await _sendEmergencySmsRaw(
-      position.latitude,
-      position.longitude,
-      authorization,
-    );
-  }
-
-  // 좌표(위도/경도)로 직접 긴급 SMS 발송
-  Future<void> _sendEmergencySmsRaw(
-      double lat, double lon, int authorization) async {
-    if (!_isAuthorizedFor(authorization)) return;
-    final message = Uri.encodeComponent(
-      '[Dae-Byeon-BOX 긴급 알림] '
-      '충격이 감지되었습니다. '
-      '위치: https://maps.google.com/?q=$lat,$lon '
-      '발생 시각: ${DateTime.now()}',
-    );
-
-    // 119 신고 SMS
-    final smsUri = Uri.parse('sms:119?body=$message');
-    if (await canLaunchUrl(smsUri)) {
-      if (!_isAuthorizedFor(authorization)) return;
-      await launchUrl(smsUri);
-    }
+    // Unanswered alerts are handled by the single 15-second screen timer.
   }
 
   // ── 감지 상태 초기화 (사용자가 "괜찮아요" 누른 경우) ────

@@ -1,6 +1,7 @@
 // lib/screens/accident/first_response_screen.dart
 // 테슬라 미니멀 스타일 - 색 최소화, 통일감
 
+import 'dart:async';
 import 'dart:io' if (dart.library.html) '../../utils/io_web_stub.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -22,11 +23,17 @@ import '../../utils/theme.dart';
 class FirstResponseScreen extends ConsumerStatefulWidget {
   final String accidentId;
   final bool initialVideoStep;
+  final String? hardwareEventId;
+  final String? hardwareDeviceId;
+  final DateTime? hardwareTriggerUtc;
 
   const FirstResponseScreen({
     super.key,
     required this.accidentId,
     this.initialVideoStep = false,
+    this.hardwareEventId,
+    this.hardwareDeviceId,
+    this.hardwareTriggerUtc,
   });
 
   @override
@@ -36,13 +43,19 @@ class FirstResponseScreen extends ConsumerStatefulWidget {
 
 class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
   final ImagePicker _picker = ImagePicker();
-  late final void Function() _cancelVideoRequest;
+  void Function() _cancelVideoRequest = () {};
   int _photoCount = 0;
   int _videoCount = 0;
   int _currentStep = 0;
   String? _caseId;
   String? _caseError;
   bool _uploadingEvidence = false;
+  Timer? _hardwareRetry;
+  bool _initializingCase = false;
+  bool _waitingForHardware = false;
+  bool _caseIsDemo = false;
+  DateTime? _hardwareWaitStarted;
+  String get _effectiveCaseId => _caseId ?? widget.accidentId;
   final Set<String> _checkedChecklistItems = {};
 
   final _insuranceCache = const OwnerFencedInsuranceCache(SecureAuthStore());
@@ -63,45 +76,92 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
 
   @override
   void dispose() {
+    _hardwareRetry?.cancel();
     _cancelVideoRequest();
     super.dispose();
   }
 
-  Future<void> _initializeCase() async {
+  Future<void> _initializeCase({bool automatic = false}) async {
+    if (_initializingCase || !mounted) return;
+    _initializingCase = true;
+    _hardwareRetry?.cancel();
+    _hardwareRetry = null;
+    if (!automatic) _hardwareWaitStarted = DateTime.now();
+    String? downloadCaseId;
     final auth = ref.read(authProvider.notifier);
     final generation = auth.sessionGeneration;
     final owner = authenticatedPrincipal(ref.read(authProvider));
     bool isCurrentOwner() =>
         mounted &&
-            owner != null &&
-            auth.sessionGeneration == generation &&
-            authenticatedPrincipal(ref.read(authProvider)) == owner;
+        owner != null &&
+        auth.sessionGeneration == generation &&
+        authenticatedPrincipal(ref.read(authProvider)) == owner;
     try {
-      final backendCase = await ref
-          .read(caseServiceProvider)
-          .selectOwnedCase(widget.accidentId);
-      if (!isCurrentOwner() || backendCase.id != widget.accidentId) return;
+      if (widget.hardwareEventId != null &&
+          widget.hardwareDeviceId != null &&
+          _caseId == null) {
+        final hardwareCase =
+            await ref.read(caseServiceProvider).findHardwareEventCase(
+                  widget.hardwareEventId!,
+                  widget.hardwareDeviceId!,
+                  triggeredAt: widget.hardwareTriggerUtc,
+                );
+        if (!isCurrentOwner()) return;
+        if (hardwareCase == null) {
+          final timedOut = DateTime.now()
+                  .difference(_hardwareWaitStarted ?? DateTime.now()) >=
+              const Duration(minutes: 3);
+          setState(() {
+            _waitingForHardware = !timedOut;
+            _caseError = timedOut ? '영상 등록이 지연되고 있습니다. 잠시 후 다시 확인해 주세요.' : null;
+          });
+          if (!timedOut) {
+            _hardwareRetry = Timer(const Duration(seconds: 2),
+                () => _initializeCase(automatic: true));
+          }
+          return;
+        }
+        _hardwareRetry?.cancel();
+        _caseId = hardwareCase.id;
+      }
+      final backendCase =
+          await ref.read(caseServiceProvider).selectOwnedCase(_effectiveCaseId);
+      if (!isCurrentOwner() || backendCase.id != _effectiveCaseId) return;
       setState(() {
         _caseId = backendCase.id;
+        _caseIsDemo = backendCase.isDemo;
         _caseError = null;
+        _waitingForHardware = false;
       });
-      await ref
+      _cancelVideoRequest = ref
           .read(blackboxVideoProvider.notifier)
-          .fetchAndDownload(backendCase.id);
+          .cancellationHandleForCase(backendCase.id);
+      downloadCaseId = backendCase.id;
     } catch (error) {
       if (!isCurrentOwner()) return;
-      setState(() => _caseError = error.toString());
-      _showMessage(error.toString());
+      setState(() {
+        _caseError = error.toString();
+        _waitingForHardware = false;
+      });
+    } finally {
+      _initializingCase = false;
+    }
+    // Video polling can take minutes; it must not hold the case-lookup guard.
+    if (downloadCaseId != null && isCurrentOwner()) {
+      await ref
+          .read(blackboxVideoProvider.notifier)
+          .fetchAndDownload(downloadCaseId);
     }
   }
 
   Future<String> _requireOwnedCase() async {
     final backendCase =
-    await ref.read(caseServiceProvider).selectOwnedCase(widget.accidentId);
-    if (!mounted || backendCase.id != widget.accidentId) {
+        await ref.read(caseServiceProvider).selectOwnedCase(_effectiveCaseId);
+    if (!mounted || backendCase.id != _effectiveCaseId) {
       throw const InvalidBackendCaseException('사고 사건이 변경되었습니다. 다시 시도해 주세요.');
     }
     _caseId = backendCase.id;
+    _caseIsDemo = backendCase.isDemo;
     _caseError = null;
     return backendCase.id;
   }
@@ -113,7 +173,7 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
     if (owner == null || owner.isEmpty) return;
     bool isCurrentOwner() =>
         authNotifier.sessionGeneration == generation &&
-            ref.read(authProvider).email?.trim().toLowerCase() == owner;
+        ref.read(authProvider).email?.trim().toLowerCase() == owner;
     final profile = await ref.read(profileServiceProvider).fetchProfile();
     if (!mounted || !isCurrentOwner()) return;
     if (profile != null) {
@@ -263,7 +323,7 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
               height: 3,
               decoration: BoxDecoration(
                 color:
-                isDone || isCurrent ? AppTheme.teslaRed : AppTheme.divider,
+                    isDone || isCurrent ? AppTheme.teslaRed : AppTheme.divider,
                 borderRadius: BorderRadius.circular(2),
               ),
             ),
@@ -589,17 +649,22 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
   // ── 블랙박스 영상 섹션 ───────────────────────────────────
   Widget _buildVideoSection() {
     final received = ref.watch(blackboxVideoProvider);
-    if (_caseId != widget.accidentId) {
+    if (_caseId == null || _caseId != _effectiveCaseId) {
       return _buildVideoStatus(
         icon: Icons.search_rounded,
-        title: _caseError == null ? '영상 확인 중' : '사고 사건을 확인할 수 없습니다',
-        subtitle: _caseError ?? '사고 사건을 확인하고 있습니다',
-        showLoading: _caseError == null,
-        showRetry: _caseError != null,
+        title: _waitingForHardware
+            ? '사고 영상 등록 대기 중'
+            : (_caseError == null ? '영상 확인 중' : '사고 사건을 확인할 수 없습니다'),
+        subtitle: _caseError ??
+            (_waitingForHardware
+                ? '블랙박스가 영상을 저장·전송 중입니다. 자동으로 다시 확인합니다.'
+                : '사고 사건을 확인하고 있습니다'),
+        showLoading: _caseError == null && !_waitingForHardware,
+        showRetry: true,
       );
     }
     final videoState =
-    received.caseId == _caseId ? received : const BlackboxVideoState();
+        received.caseId == _caseId ? received : const BlackboxVideoState();
 
     switch (videoState.status) {
       case VideoStatus.waiting:
@@ -664,7 +729,9 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
               ],
             ),
             const SizedBox(height: 16),
-            BlackboxVideoPlayerWidget(localPath: videoState.localPath!),
+            BlackboxVideoPlayerWidget(
+              localPath: videoState.localPath ?? '',
+            ),
             const SizedBox(height: 16),
             GestureDetector(
               onTap: _showMapSheet,
@@ -745,8 +812,8 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
                 ),
                 const SizedBox(height: 8),
                 AccidentLocationMap(
-                  key: ValueKey('map-${widget.accidentId}'),
-                  caseId: widget.accidentId,
+                  key: ValueKey('map-$_effectiveCaseId'),
+                  caseId: _effectiveCaseId,
                 ),
               ],
             ),
@@ -772,7 +839,7 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
           height: 56,
           child: showLoading
               ? const CircularProgressIndicator(
-              strokeWidth: 2, color: AppTheme.teslaRed)
+                  strokeWidth: 2, color: AppTheme.teslaRed)
               : Icon(icon, color: AppTheme.textSub, size: 48),
         ),
         const SizedBox(height: 20),
@@ -798,12 +865,7 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
           const SizedBox(height: 20),
           GestureDetector(
             onTap: () async {
-              try {
-                final caseId = await _requireOwnedCase();
-                await ref.read(blackboxVideoProvider.notifier).retry(caseId);
-              } catch (error) {
-                if (mounted) _showMessage(error.toString());
-              }
+              await _initializeCase();
             },
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
@@ -863,7 +925,8 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
   Widget _buildBottomButton() {
     final videoState = ref.watch(blackboxVideoProvider);
     final isVideoStep = _currentStep == _steps.length - 1;
-    final analysisReady = _caseId == widget.accidentId &&
+    final analysisReady = _caseId != null &&
+        _caseId == _effectiveCaseId &&
         videoState.caseId == _caseId &&
         videoState.status == VideoStatus.ready &&
         videoState.localPath != null;
@@ -873,12 +936,12 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
       child: GestureDetector(
         onTap: enabled
             ? () async {
-          if (_currentStep < _steps.length - 1) {
-            setState(() => _currentStep++);
-          } else {
-            await _startAnalysis();
-          }
-        }
+                if (_currentStep < _steps.length - 1) {
+                  setState(() => _currentStep++);
+                } else {
+                  await _startAnalysis();
+                }
+              }
             : null,
         child: Container(
           width: double.infinity,
@@ -889,7 +952,11 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
           ),
           child: Center(
             child: Text(
-              _currentStep < _steps.length - 1 ? '다음 단계' : 'AI 과실 분석 시작',
+              _currentStep < _steps.length - 1
+                  ? '다음 단계'
+                  : _caseIsDemo
+                      ? '주차장 모델로 분석'
+                      : 'AI 과실 분석 시작',
               style: TextStyle(
                 color: enabled ? Colors.black : AppTheme.textHint,
                 fontSize: 16,
@@ -907,10 +974,10 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
   Future<void> _openVideoPicker() async {
     final selected = await showAccidentCasePicker(
       context,
-      currentCaseId: widget.accidentId,
+      currentCaseId: _effectiveCaseId,
     );
     if (!mounted || selected == null) return;
-    if (selected == widget.accidentId) {
+    if (selected == _effectiveCaseId) {
       // 지금 보고 있는 사고를 다시 고르면 영상만 다시 불러온다.
       await _initializeCase();
       return;
@@ -929,9 +996,9 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
     final generation = LocalAppFiles.accountCleanupGeneration;
     bool current() =>
         mounted &&
-            principal != null &&
-            principal == authenticatedPrincipal(ref.read(authProvider)) &&
-            generation == LocalAppFiles.accountCleanupGeneration;
+        principal != null &&
+        principal == authenticatedPrincipal(ref.read(authProvider)) &&
+        generation == LocalAppFiles.accountCleanupGeneration;
     final caseId = await _guardedCase();
     if (caseId == null || !current()) return;
     final photo = await _picker.pickImage(
@@ -944,7 +1011,7 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
       return;
     }
     final mime =
-    photo.path.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
+        photo.path.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
     try {
       final cached = await cacheLocalCasePhoto(
         caseId: caseId,
@@ -1035,7 +1102,7 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
     final uri = Uri(scheme: 'tel', path: cleanNumber);
     try {
       final launched =
-      await launchUrl(uri, mode: LaunchMode.externalApplication);
+          await launchUrl(uri, mode: LaunchMode.externalApplication);
       if (!launched && mounted) _showPhoneFailure(number);
     } catch (_) {
       if (mounted) _showPhoneFailure(number);
@@ -1084,9 +1151,9 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
     final generation = LocalAppFiles.accountCleanupGeneration;
     bool current() =>
         mounted &&
-            principal != null &&
-            principal == authenticatedPrincipal(ref.read(authProvider)) &&
-            generation == LocalAppFiles.accountCleanupGeneration;
+        principal != null &&
+        principal == authenticatedPrincipal(ref.read(authProvider)) &&
+        generation == LocalAppFiles.accountCleanupGeneration;
     setState(() => _uploadingEvidence = true);
     try {
       final confirmed = await _requireOwnedCase();
@@ -1095,11 +1162,11 @@ class _FirstResponseScreenState extends ConsumerState<FirstResponseScreen> {
         throw const InvalidBackendCaseException('사고 사건이 변경되었습니다.');
       }
       await ref.read(backendEvidenceServiceProvider).uploadEvidence(
-        caseId: confirmed,
-        path: path,
-        kind: kind,
-        mime: mime,
-      );
+            caseId: confirmed,
+            path: path,
+            kind: kind,
+            mime: mime,
+          );
       if (!current() || _caseId != confirmed) return false;
       setState(() => onComplete?.call());
       _showMessage('증거 파일이 사건에 안전하게 저장되었습니다.');

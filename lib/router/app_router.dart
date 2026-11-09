@@ -157,16 +157,31 @@ final appRouterProvider = Provider<GoRouter>((ref) {
           GoRoute(
             path: '/my-reports',
             name: 'my-reports',
-            builder: (ctx, state) => const MyReportsScreen(),
+            builder: (ctx, state) => MyReportsScreen(
+              initialCaseId: state.extra as String?,
+            ),
           ),
 
           // ── 사고 감지 화면 (E-Call 가상화, 충격 감지) ─────────────
           GoRoute(
             path: '/accident-detected',
             name: 'accident-detected',
-            builder: (ctx, state) => AccidentDetectionScreen(
-              caseId: state.extra as String?,
-            ),
+            builder: (ctx, state) {
+              final extra = state.extra;
+              if (extra is Map) {
+                final triggeredAt = extra['triggered_at'];
+                return AccidentDetectionScreen(
+                  caseId: extra['case_id'] as String?,
+                  impactG: (extra['impact_g'] as num?)?.toDouble(),
+                  deviceName: extra['device_name'] as String?,
+                  eventId: extra['event_id'] as String?,
+                  deviceId: extra['device_id'] as String?,
+                  triggeredAt: triggeredAt is DateTime ? triggeredAt : null,
+                  isTestEvent: extra['test_event'] == true,
+                );
+              }
+              return AccidentDetectionScreen(caseId: extra as String?);
+            },
           ),
 
           // ── 초동 대처 가이드 (사고 접수 활성화) ───────────────────
@@ -184,6 +199,9 @@ final appRouterProvider = Provider<GoRouter>((ref) {
                 key: ValueKey(accidentId),
                 accidentId: accidentId,
                 initialVideoStep: initialVideoStep,
+                hardwareEventId: extra is Map ? extra['hardware_event_id'] as String? : null,
+                hardwareDeviceId: extra is Map ? extra['hardware_device_id'] as String? : null,
+                hardwareTriggerUtc: extra is Map ? extra['hardware_trigger_utc'] as DateTime? : null,
               );
             },
           ),

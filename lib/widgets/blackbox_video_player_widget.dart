@@ -13,7 +13,7 @@ import 'package:video_player/video_player.dart';
 import '../utils/theme.dart';
 
 class BlackboxVideoPlayerWidget extends StatefulWidget {
-  final String localPath; // 다운로드된 로컬 파일 경로
+  final String localPath; // 앱: 다운로드된 로컬 파일 경로 / 웹: 서버 영상 주소
 
   const BlackboxVideoPlayerWidget({super.key, required this.localPath});
 
@@ -35,20 +35,24 @@ class _BlackboxVideoPlayerWidgetState
   }
 
   Future<void> _initializeVideo() async {
-    // 웹: 로컬 파일 재생(dart:io File) 미지원 — 서버 영상은 별도 경로로 처리
-    if (kIsWeb) {
-      setState(() => _hasError = true);
-      return;
-    }
     try {
+      // 웹: 파일 저장이 안 되므로 localPath 에 담긴 서버 영상 주소로 바로 재생
+      if (kIsWeb) {
+        _controller = VideoPlayerController.networkUrl(
+          Uri.parse(widget.localPath),
+        );
+        await _controller!.initialize();
+        if (mounted) setState(() => _isInitialized = true);
+        return;
+      }
       // 로컬 파일로 재생 (네트워크가 아닌 file)
       // 웹 빌드의 스텁 File 타입과 video_player(dart:io File)의 타입 충돌을
       // 피하기 위해 dynamic 경유. (웹에서는 위 kIsWeb 가드로 실행되지 않음)
       _controller = VideoPlayerController.file(File(widget.localPath) as dynamic);
       await _controller!.initialize();
-      setState(() => _isInitialized = true);
+      if (mounted) setState(() => _isInitialized = true);
     } catch (e) {
-      setState(() => _hasError = true);
+      if (mounted) setState(() => _hasError = true);
     }
   }
 
