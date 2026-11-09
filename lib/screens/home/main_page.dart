@@ -1,6 +1,8 @@
 // lib/screens/home/main_page.dart
 // 테슬라 미니멀 스타일
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -10,7 +12,6 @@ import '../../services/case_service.dart';
 import '../../services/sensor_service.dart';
 import '../../services/location_service.dart';
 import '../../utils/theme.dart';
-import '../../widgets/accident_alert_dialog.dart';
 import '../../widgets/brand_logo.dart';
 
 class MainPage extends ConsumerStatefulWidget {
@@ -20,15 +21,168 @@ class MainPage extends ConsumerStatefulWidget {
   ConsumerState<MainPage> createState() => _MainPageState();
 }
 
-class _MainPageState extends ConsumerState<MainPage> {
+class _MainPageState extends ConsumerState<MainPage>
+    with WidgetsBindingObserver {
   bool _openingManualIncident = false;
+  Timer? _hardwareCheckTimer;
+  bool _hardwareCheckInFlight = false;
+  bool _hardwareBaselineLoaded = false;
+  bool _hardwareEventBaselineLoaded = false;
+  bool _hardwareAlertShown = false;
+  bool _appIsActive = true;
+  String? _lastHardwareCaseId;
+  String? _hardwareOwner;
+  final DateTime _hardwarePollingStartedAt = DateTime.now().toUtc();
+  final Set<String> _seenHardwareEventIds = <String>{};
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(locationProvider.notifier).requestLocationAndFetch();
+      _checkHardwareTrigger();
+      _hardwareCheckTimer = Timer.periodic(
+        const Duration(seconds: 1),
+        (_) => _checkHardwareTrigger(),
+      );
     });
+  }
+
+  @override
+  void dispose() {
+    _hardwareCheckTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appIsActive = state == AppLifecycleState.resumed ||
+        state == AppLifecycleState.inactive;
+    if (_appIsActive) _checkHardwareTrigger();
+  }
+
+  Future<void> _checkHardwareTrigger() async {
+    if (!mounted ||
+        !_appIsActive ||
+        _hardwareCheckInFlight ||
+        ModalRoute.of(context)?.isCurrent == false) {
+      return;
+    }
+
+    final authState = ref.read(authProvider);
+    final owner = authenticatedPrincipal(authState);
+    if (owner == null) {
+      _hardwareOwner = null;
+      _lastHardwareCaseId = null;
+      _hardwareBaselineLoaded = false;
+      _hardwareEventBaselineLoaded = false;
+      _seenHardwareEventIds.clear();
+      return;
+    }
+    if (_hardwareOwner != owner) {
+      _hardwareOwner = owner;
+      _lastHardwareCaseId = null;
+      _hardwareBaselineLoaded = false;
+      _hardwareEventBaselineLoaded = false;
+      _seenHardwareEventIds.clear();
+    }
+
+    final auth = ref.read(authProvider.notifier);
+    final sessionGeneration = auth.sessionGeneration;
+    _hardwareCheckInFlight = true;
+    try {
+      final caseService = ref.read(caseServiceProvider);
+      BackendCase? latest;
+      List<BackendHardwareEvent> hardwareEvents = const [];
+      try {
+        latest = await caseService.peekLatestHardwareCase();
+      } on Object {
+        // The MQTT alert feed is independent of completed video cases.
+      }
+      try {
+        hardwareEvents = await caseService.peekRecentHardwareEvents();
+      } on Object {
+        // Retry either source on the next one-second tick.
+      }
+      if (!mounted ||
+          auth.sessionGeneration != sessionGeneration ||
+          authenticatedPrincipal(ref.read(authProvider)) != owner) {
+        return;
+      }
+
+      if (!_hardwareEventBaselineLoaded) {
+        _hardwareEventBaselineLoaded = true;
+        final recentEvents = hardwareEvents
+            .where((event) => !event.triggeredAt.isBefore(
+                  _hardwarePollingStartedAt.subtract(
+                    const Duration(seconds: 15),
+                  ),
+                ))
+            .toList(growable: false);
+        _seenHardwareEventIds.addAll(
+          hardwareEvents
+              .where((event) => !recentEvents.contains(event))
+              .map((event) => event.eventId),
+        );
+        if (recentEvents.isNotEmpty) {
+          _seenHardwareEventIds.addAll(
+            recentEvents.map((event) => event.eventId),
+          );
+          _showHardwareEvent(recentEvents.first);
+        }
+      } else {
+        final freshEvents = hardwareEvents
+            .where((event) => _seenHardwareEventIds.add(event.eventId))
+            .toList(growable: false);
+        if (freshEvents.isNotEmpty) {
+          _showHardwareEvent(freshEvents.first);
+        }
+      }
+
+      if (!_hardwareBaselineLoaded) {
+        _hardwareBaselineLoaded = true;
+        _lastHardwareCaseId = latest?.id;
+        return;
+      }
+
+      if (latest == null || latest.id == _lastHardwareCaseId) return;
+      _lastHardwareCaseId = latest.id;
+      if (hardwareEvents.any((event) => event.caseId == latest!.id)) return;
+      if (_hardwareAlertShown) return;
+      _showHardwareIncident(latest);
+    } on Object {
+      // Retry on the next one-second tick; keep the last visible app state.
+    } finally {
+      _hardwareCheckInFlight = false;
+    }
+  }
+
+  void _showHardwareEvent(BackendHardwareEvent event) {
+    if (!mounted || _hardwareAlertShown) return;
+    _hardwareAlertShown = true;
+    final route = context.pushNamed<void>(
+      'accident-detected',
+      extra: {
+        'case_id': event.caseId,
+        'device_id': event.deviceId,
+        'impact_g': event.impactG,
+        'device_name': event.deviceName,
+        'event_id': event.eventId,
+        'triggered_at': event.triggeredAt,
+        'test_event': event.isTestEvent,
+      },
+    );
+    unawaited(route.whenComplete(() => _hardwareAlertShown = false));
+  }
+
+  void _showHardwareIncident(BackendCase incident) {
+    if (!mounted || _hardwareAlertShown) return;
+    _hardwareAlertShown = true;
+    final route =
+        context.pushNamed<void>('accident-detected', extra: incident.id);
+    unawaited(route.whenComplete(() => _hardwareAlertShown = false));
   }
 
   @override
@@ -36,24 +190,17 @@ class _MainPageState extends ConsumerState<MainPage> {
     final sensorState = ref.watch(sensorProvider);
 
     ref.listen<SensorState>(sensorProvider, (prev, next) {
-      if (next.isImpactDetected && !(prev?.isImpactDetected ?? false)) {
-        showDialog(
-          context: context,
-          barrierDismissible: false,
-          builder: (dialogContext) => AccidentAlertDialog(
-            gForce: next.currentGForce,
-            onAccident: () {
-              final caseId = next.caseId;
-              Navigator.pop(dialogContext);
-              ref.read(sensorProvider.notifier).dismissAlert();
-              context.pushNamed('accident-detected', extra: caseId);
-            },
-            onDismiss: () {
-              Navigator.pop(dialogContext);
-              ref.read(sensorProvider.notifier).dismissAlert();
-            },
-          ),
-        );
+      if (next.isImpactDetected &&
+          !(prev?.isImpactDetected ?? false) &&
+          !_hardwareAlertShown &&
+          ModalRoute.of(context)?.isCurrent != false) {
+        _hardwareAlertShown = true;
+        final route = context.pushNamed<void>('accident-detected', extra: {
+          'case_id': next.caseId,
+          'impact_g': next.detectedGForce,
+          'triggered_at': next.detectedAt,
+        });
+        unawaited(route.whenComplete(() => _hardwareAlertShown = false));
       }
     });
 
@@ -147,7 +294,7 @@ class _MainPageState extends ConsumerState<MainPage> {
                         label: '현재 충격',
                       ),
                       _buildStat(
-                        value: '2.5',
+                        value: kImpactThresholdG.toStringAsFixed(1),
                         unit: 'G',
                         label: '감지 임계값',
                         alignRight: false,
@@ -215,10 +362,10 @@ class _MainPageState extends ConsumerState<MainPage> {
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       const Icon(
-                          Icons.video_library_outlined,
-                          color: Colors.white,
-                          size: 20,
-                        ),
+                        Icons.video_library_outlined,
+                        color: Colors.white,
+                        size: 20,
+                      ),
                       const SizedBox(width: 10),
                       const Text(
                         '사고 영상 기록',

@@ -2,16 +2,15 @@
 
 ## English
 
-Flutter app delivered together with the backend on `REAL_MOCKUP`.
-Backend sources remain at the repository root; mobile sources live in `app/`.
-Use the backend source from the same commit for matching contracts.
-This is a normal directory, not a Git submodule. Source: `pth888/driveguard-ai`
+This repository contains the root-level Flutter mobile client. The backend is
+deployed separately; see [current runtime handoff](docs/mobile-runtime-handoff-20261109.md)
+for required API contracts and verification limits.
+This is a normal directory, not a Git submodule. Original source: `pth888/driveguard-ai`
 base `92fbec0a`, with model-input changes from `7b386b8`.
 
-From the Blackbox repository root:
+From this repository root:
 
 ```bash
-cd app
 flutter pub get
 flutter test
 flutter run --dart-define=API_BASE_URL=https://<private-api-host>
@@ -53,8 +52,8 @@ build. Signing/entitlements and real-device acceptance must be checked separatel
 
 ## 한국어
 
-우리 blackbox-ai 저장소 REAL_MOCKUP 브랜치의 app/에 최신 앱 소스를 넣었다.
-백엔드는 기존 위치에 유지하며 서브모듈이 아니다. 위 명령은 app/에서 실행한다.
+이 저장소는 루트에 Flutter 앱 소스를 두며, 백엔드는 별도로 배포한다.
+서브모듈이 아니다. 위 명령은 이 저장소 루트에서 실행한다.
 앱·백엔드 핸드오프를 먼저 읽고 휴대폰용 사설 API/저장소 주소와 인증·장치 매핑을 맞춘다.
 실제 환경 파일·서버 인증·서명키·빌드/캐시 파일은 제외했다.
 

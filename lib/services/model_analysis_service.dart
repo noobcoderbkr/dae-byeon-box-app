@@ -553,6 +553,15 @@ class ModelAnalysisException implements Exception {
   String toString() => message;
 }
 
+/// 분석 작업을 정해진 시간 동안 기다렸지만 끝나지 않은 경우.
+/// 서버 작업은 취소하지 않으므로, 같은 작업 ID로 다시 조회할 수 있다.
+class AnalysisJobTimeoutException extends ModelAnalysisException {
+  const AnalysisJobTimeoutException(this.jobId)
+      : super('모델 분석 대기 시간이 초과되었습니다.');
+
+  final String jobId;
+}
+
 class MissingCaseMappingException extends ModelAnalysisException {
   const MissingCaseMappingException(super.message);
 }
@@ -571,6 +580,7 @@ class ModelAnalysisService {
     required AccessTokenProvider accessToken,
     this.pollInterval = const Duration(seconds: 1),
     this.maxPollAttempts = 120,
+    this.maxPollDuration = const Duration(minutes: 2),
   })  : _dio = dio,
         _accessToken = accessToken;
 
@@ -578,6 +588,7 @@ class ModelAnalysisService {
   final AccessTokenProvider _accessToken;
   final Duration pollInterval;
   final int maxPollAttempts;
+  final Duration maxPollDuration;
 
   static bool isBackendCaseId(String value) =>
       _backendCaseIdPattern.hasMatch(value);
@@ -703,7 +714,9 @@ class ModelAnalysisService {
     String jobId, {
     String? expectedReportId,
   }) async {
+    final stopwatch = Stopwatch()..start();
     for (var attempt = 0; attempt < maxPollAttempts; attempt++) {
+      if (stopwatch.elapsed > maxPollDuration) break;
       if (attempt > 0 && pollInterval > Duration.zero) {
         await Future<void>.delayed(pollInterval);
       }
@@ -746,7 +759,8 @@ class ModelAnalysisService {
         throw const ModelAnalysisException('분석 작업 상태를 확인할 수 없습니다.');
       }
     }
-    throw const ModelAnalysisException('모델 분석 대기 시간이 초과되었습니다.');
+    // 서버 작업은 계속될 수 있으므로 같은 작업 ID를 넘겨 이어서 조회하게 한다.
+    throw AnalysisJobTimeoutException(jobId);
   }
 
   Future<Response<dynamic>> _authorizedGet(
